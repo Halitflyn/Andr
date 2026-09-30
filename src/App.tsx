@@ -49,7 +49,9 @@ import {
   RefreshCw,
   AlertTriangle,
   FileAudio,
-  HardDrive
+  HardDrive,
+  Subtitles,
+  Disc
 } from 'lucide-react';
 import { rulesData as defaultRules, tracksData as defaultTracks, Track, AlphabetItem, DictionaryItem, GrammarItem, SubtitleCue, alphabetData as defaultAlphabet, grammarData as defaultGrammar } from './data';
 import { downloadGitHubUpdateZip, downloadDataTsOnly } from './utils/githubExporter';
@@ -817,6 +819,14 @@ export default function App() {
   };
 
   const handleTrackEnd = () => {
+    if (showCapCutStudio) {
+      // In CapCut Studio: NEVER switch track! Loop current track so work is never lost!
+      if (audioRef.current) {
+        audioRef.current.currentTime = 0;
+        audioRef.current.play().catch(() => {});
+      }
+      return;
+    }
     if (isRepeat) {
       if (audioRef.current) {
         audioRef.current.currentTime = 0;
@@ -848,6 +858,10 @@ export default function App() {
   };
 
   const nextTrack = (delta = 1) => {
+    if (showCapCutStudio) {
+      // Lock track while in CapCut Studio so subtitle work is never interrupted
+      return;
+    }
     if (isRepeat && delta === 1 && audioRef.current) {
       audioRef.current.currentTime = 0;
       audioRef.current.play().catch(() => {});
@@ -1668,6 +1682,106 @@ export default function App() {
         onError={handleAudioError}
       />
 
+      {/* Floating Quick Music Controller in Top-Left Corner ("Поплавок") */}
+      {currentTrack && (
+        <div
+          className="fixed top-3 left-3 z-50 flex items-center bg-black/85 backdrop-blur-md border border-neon-cyan/40 hover:border-neon-cyan/80 rounded-2xl shadow-[0_0_20px_rgba(0,0,0,0.85),0_0_12px_rgba(102,252,241,0.2)] transition-all duration-200 select-none overflow-hidden max-w-[270px] sm:max-w-xs group"
+          title={`Поплавок швидкого керування: ${currentTrack.title}`}
+        >
+          {/* Progress Bar along the bottom of the float pill */}
+          <div
+            className="absolute bottom-0 left-0 h-[2px] bg-gradient-to-r from-neon-teal to-neon-cyan shadow-[0_0_8px_#66fcf1] transition-all duration-150"
+            style={{ width: `${Math.min(100, Math.max(0, (progress / (duration || 1)) * 100))}%` }}
+          />
+
+          {/* Mini Vinyl / Disc & Track Info (clicking switches to music tab) */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('music');
+              window.scrollTo({ top: 320, behavior: 'smooth' });
+            }}
+            className="flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 transition-colors cursor-pointer text-left overflow-hidden min-w-0"
+            title="Перейти до плеєра сувоїв"
+          >
+            {/* Spinning Vinyl Disc */}
+            <div className="relative w-7 h-7 shrink-0 rounded-full bg-black border border-neon-teal/50 flex items-center justify-center shadow-[0_0_8px_rgba(102,252,241,0.3)]">
+              <Disc
+                size={18}
+                className={`text-neon-cyan transition-transform ${
+                  isPlaying ? 'animate-[spin_4s_linear_infinite]' : 'opacity-70'
+                }`}
+              />
+              {/* Glowing center indicator */}
+              <div
+                className={`absolute w-1.5 h-1.5 rounded-full ${
+                  isPlaying ? 'bg-neon-green shadow-[0_0_6px_#10b981]' : 'bg-gray-500'
+                }`}
+              />
+            </div>
+
+            {/* Song Title & Time */}
+            <div className="flex flex-col min-w-0 leading-tight">
+              <span className="text-[11px] font-bold text-white truncate max-w-[85px] sm:max-w-[120px] font-cinzel">
+                {currentTrack.title || 'Сувій'}
+              </span>
+              <span className="text-[9px] font-mono text-neon-cyan/80">
+                {formatTime(progress)} / {formatTime(duration)}
+              </span>
+            </div>
+          </button>
+
+          {/* Quick Action Controls (Skip Back, Stop/Play, Skip Forward) */}
+          <div className="flex items-center gap-1 pr-2 pl-1 border-l border-neon-teal/20 my-1 shrink-0">
+            {/* Previous track */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                nextTrack(-1);
+              }}
+              className="p-1 rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
+              title="Попередній трек"
+              aria-label="Попередній трек"
+            >
+              <SkipBack size={13} />
+            </button>
+
+            {/* Play / Stop (Pause) */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                togglePlay();
+              }}
+              className={`w-6 h-6 rounded-full flex items-center justify-center transition-all cursor-pointer ${
+                isPlaying
+                  ? 'bg-neon-cyan text-black shadow-[0_0_10px_#66fcf1] hover:scale-105'
+                  : 'bg-neon-cyan/20 border border-neon-cyan text-neon-cyan hover:bg-neon-cyan hover:text-black'
+              }`}
+              title={isPlaying ? 'Зупинити пісню (Пауза)' : 'Відтворити'}
+              aria-label={isPlaying ? 'Зупинити пісню' : 'Відтворити пісню'}
+            >
+              {isPlaying ? <Pause size={12} className="fill-current" /> : <Play size={12} className="fill-current ml-0.5" />}
+            </button>
+
+            {/* Skip track forward */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                nextTrack(1);
+              }}
+              className="p-1 rounded-lg text-gray-400 hover:text-neon-cyan hover:bg-white/10 transition-all cursor-pointer"
+              title="Скіпнути пісню (Наступний трек)"
+              aria-label="Скіпнути пісню"
+            >
+              <SkipForward size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Interactive Top Cyber Eye */}
       <div
         ref={eyeRef}
@@ -2067,15 +2181,15 @@ export default function App() {
                     <div className="flex items-center gap-2">
                       <button
                         onClick={toggleLike}
-                        className={`p-1.5 rounded-lg border transition-all cursor-pointer flex items-center gap-1 text-xs font-mono ${
+                        className={`p-1.5 rounded-lg border transition-all cursor-pointer flex items-center justify-center ${
                           likedTracks.includes(currentTrack?.filename || currentTrack?.id || '')
                             ? 'bg-red-500/20 text-red-400 border-red-500/50 shadow-[0_0_10px_rgba(239,68,68,0.3)]'
                             : 'text-gray-400 border-transparent hover:text-white'
                         }`}
                         title="Вподобати"
+                        aria-label="Вподобати"
                       >
-                        <Heart size={15} className={likedTracks.includes(currentTrack?.filename || currentTrack?.id || '') ? 'fill-red-400' : ''} />
-                        <span>{globalLikes[currentTrack?.filename || currentTrack?.id || ''] || 0}</span>
+                        <Heart size={16} className={likedTracks.includes(currentTrack?.filename || currentTrack?.id || '') ? 'fill-red-400' : ''} />
                       </button>
                       <button
                         onClick={toggleDislike}
@@ -2106,14 +2220,38 @@ export default function App() {
                   {subtitlesEnabled && (
                     <div className="bg-black/75 border border-neon-cyan/40 rounded-xl p-3 my-2 text-center shadow-[inset_0_0_15px_rgba(0,0,0,0.6)] min-h-[50px] flex items-center justify-center">
                       {currentSubtitle ? (
-                        <div className="relative inline-block text-sm sm:text-base font-cinzel font-bold">
-                          <span className="text-gray-500">{currentSubtitle.text}</span>
-                          <span
-                            className="absolute top-0 left-0 text-neon-cyan overflow-hidden whitespace-nowrap drop-shadow-[0_0_10px_#66fcf1]"
-                            style={{ width: `${currentSubProgress * 100}%` }}
-                          >
-                            {currentSubtitle.text}
-                          </span>
+                        <div className="flex flex-wrap justify-center items-center gap-x-2 gap-y-1 text-sm sm:text-base font-cinzel font-bold max-w-full">
+                          {(() => {
+                            const words = currentSubtitle.words && currentSubtitle.words.length > 0
+                              ? currentSubtitle.words
+                              : currentSubtitle.text.trim().split(/\s+/).map((w, _, arr) => ({
+                                  word: w,
+                                  duration: (currentSubtitle.endTime - currentSubtitle.startTime) / Math.max(1, arr.length)
+                                }));
+
+                            let wordStartAcc = currentSubtitle.startTime;
+                            return words.map((w, wIdx) => {
+                              const wStart = wordStartAcc;
+                              const wEnd = wStart + w.duration;
+                              wordStartAcc = wEnd;
+
+                              const isPast = progress >= wEnd;
+                              const isCurrent = progress >= wStart && progress < wEnd;
+                              const wordProgress = isPast ? 1 : isCurrent && w.duration > 0 ? (progress - wStart) / w.duration : 0;
+
+                              return (
+                                <span key={wIdx} className="relative inline-block">
+                                  <span className="text-gray-500">{w.word}</span>
+                                  <span
+                                    className="absolute top-0 left-0 text-neon-cyan overflow-hidden whitespace-nowrap drop-shadow-[0_0_8px_#66fcf1]"
+                                    style={{ width: `${Math.min(100, Math.max(0, wordProgress * 100))}%` }}
+                                  >
+                                    {w.word}
+                                  </span>
+                                </span>
+                              );
+                            });
+                          })()}
                         </div>
                       ) : (
                         <span className="text-xs font-serif italic text-gray-500">
@@ -2204,21 +2342,36 @@ export default function App() {
 
                   {/* Secondary Action Row with CapCut Subtitle Studio Button */}
                   <div className="flex flex-wrap items-center gap-2.5 mt-4 pt-3 border-t border-neon-teal/20 text-xs font-cinzel">
-                    <button
-                      onClick={() => setShowCapCutStudio(true)}
-                      className="px-3.5 py-1.5 bg-gradient-to-r from-neon-teal/30 to-neon-cyan/30 border border-neon-cyan text-neon-cyan hover:text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-[0_0_12px_rgba(102,252,241,0.3)]"
-                      title="Налаштувати субтитри та таймінг літер (CapCut Studio)"
-                    >
-                      <Sparkle size={13} /> 🎬 Капкат Субтитрів
-                    </button>
+                    {/* Subtitles (Karaoke) SVG Toggle Button */}
                     <button
                       onClick={() => setSubtitlesEnabled(!subtitlesEnabled)}
-                      className={`px-3 py-1.5 rounded-xl border transition-all cursor-pointer ${
-                        subtitlesEnabled ? 'bg-neon-cyan/20 border-neon-cyan text-neon-cyan' : 'bg-black/50 border-gray-700 text-gray-400'
+                      className={`px-3 py-1.5 rounded-xl border transition-all cursor-pointer flex items-center gap-1.5 ${
+                        subtitlesEnabled
+                          ? 'bg-neon-cyan/20 border-neon-cyan text-neon-cyan shadow-[0_0_10px_rgba(102,252,241,0.25)]'
+                          : 'bg-black/50 border-gray-700 text-gray-400 hover:text-white hover:border-gray-500'
                       }`}
+                      title={subtitlesEnabled ? 'Субтитри (караоке): Увімкнено (натисніть, щоб вимкнути)' : 'Субтитри (караоке): Вимкнено (натисніть, щоб увімкнути)'}
+                      aria-label="Субтитри"
                     >
-                      Караоке рядок: {subtitlesEnabled ? 'УВІМК' : 'ВИМК'}
+                      <Subtitles size={15} className={subtitlesEnabled ? 'text-neon-cyan' : 'text-gray-400'} />
+                      <span>Субтитри</span>
+                      <span className={`text-[10px] font-mono font-bold px-1.5 py-0.2 rounded border ${
+                        subtitlesEnabled ? 'bg-neon-cyan text-black border-neon-cyan' : 'bg-black/40 text-gray-500 border-gray-700'
+                      }`}>
+                        {subtitlesEnabled ? 'ON' : 'OFF'}
+                      </span>
                     </button>
+
+                    {/* CapCut Subtitle Studio: Visible ONLY in Admin Mode */}
+                    {(isLocalAdmin || currentUser) && (
+                      <button
+                        onClick={() => setShowCapCutStudio(true)}
+                        className="px-3.5 py-1.5 bg-gradient-to-r from-neon-teal/30 to-neon-cyan/30 border border-neon-cyan text-neon-cyan hover:text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-[0_0_12px_rgba(102,252,241,0.3)]"
+                        title="Налаштувати субтитри та таймінг літер (CapCut Studio)"
+                      >
+                        <Sparkle size={13} /> 🎬 Капкат Субтитрів
+                      </button>
+                    )}
                     {currentTrack?.lyrics && (
                       <button
                         onClick={() => setShowLyricsModal(true)}
@@ -3019,7 +3172,7 @@ export default function App() {
         )}
       </div>
 
-      {/* CapCut-Style Subtitle Studio Modal */}
+      {/* CapCut Subtitle Studio Fullscreen Modal */}
       {showCapCutStudio && currentTrack && (
         <SubtitleStudio
           track={currentTrack}

@@ -61,11 +61,18 @@ export function generateDataTsSource(
     .join(',\n');
 
   return `// Auto-generated data file for Andrelf Cult Website
+export interface WordTiming {
+  word: string;
+  duration: number;
+}
+
 export interface SubtitleCue {
   id?: string;
   startTime: number;
   endTime: number;
   text: string;
+  words?: WordTiming[];
+  letterSpeed?: number;
 }
 
 export interface Track {

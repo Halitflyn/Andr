@@ -1,8 +1,15 @@
+export interface WordTiming {
+  word: string;
+  duration: number; // in seconds
+}
+
 export interface SubtitleCue {
   id?: string;
   startTime: number;
   endTime: number;
   text: string;
+  words?: WordTiming[];
+  letterSpeed?: number; // duration per letter in seconds or ms
 }
 
 export interface Track {
