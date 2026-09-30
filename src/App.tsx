@@ -403,7 +403,7 @@ export default function App() {
             author: ov.artist || trk.author,
             description: ov.description || trk.description,
             lyrics: ov.lyrics || trk.lyrics,
-            subtitles: ov.subtitles || trk.subtitles,
+            subtitles: (ov.subtitles && ov.subtitles.length >= (dt.subtitles?.length || 0)) ? ov.subtitles : (dt.subtitles || ov.subtitles),
             url: ov.url || trk.url,
             hasFile: ov.hasFile ?? trk.hasFile,
             fileType: ov.fileType || trk.fileType,
@@ -419,7 +419,7 @@ export default function App() {
             description: cm.description || trk.description,
             url: cm.url || trk.url,
             lyrics: cm.lyrics || trk.lyrics,
-            subtitles: cm.subtitles || trk.subtitles,
+            subtitles: (cm.subtitles && cm.subtitles.length >= (dt.subtitles?.length || 0)) ? cm.subtitles : (dt.subtitles || cm.subtitles),
             hasFile: cm.hasFile ?? trk.hasFile,
             fileType: cm.fileType || trk.fileType,
             isCustom: true
@@ -885,6 +885,45 @@ export default function App() {
   const togglePlay = () => {
     setIsPlaying(!isPlaying);
   };
+
+  // Global Hotkeys: Space to toggle play/pause, Left/Right arrows to seek -5s / +5s
+  // Excluded when typing in input, textarea, or contentEditable elements
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target && (
+          target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable ||
+          target.getAttribute('role') === 'textbox'
+        )
+      ) {
+        return;
+      }
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setIsPlaying(prev => !prev);
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        const cur = audioRef.current ? audioRef.current.currentTime : progress;
+        const newTime = Math.max(0, cur - 5);
+        setProgress(newTime);
+        if (audioRef.current) audioRef.current.currentTime = newTime;
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        const cur = audioRef.current ? audioRef.current.currentTime : progress;
+        const maxDur = duration || 180;
+        const newTime = Math.min(maxDur, cur + 5);
+        setProgress(newTime);
+        if (audioRef.current) audioRef.current.currentTime = newTime;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [progress, duration]);
 
   const handleProgressChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = Number(e.target.value);

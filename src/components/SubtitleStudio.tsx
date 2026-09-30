@@ -32,23 +32,37 @@ interface SubtitleStudioProps {
 }
 
 /**
- * Ensures words and durations exist for a cue
+ * Generates word timing objects from text string
  */
-function ensureCueWords(cue: SubtitleCue): WordTiming[] {
-  if (cue.words && cue.words.length > 0) {
-    return cue.words;
-  }
-  const rawWords = cue.text.trim().split(/\s+/).filter(w => w.length > 0);
+export function generateWordsFromText(text: string, totalDur: number): WordTiming[] {
+  const rawWords = (text || '').trim().split(/\s+/).filter(w => w.length > 0);
   if (rawWords.length === 0) {
-    return [{ word: cue.text || '...', duration: Math.max(0.5, cue.endTime - cue.startTime) }];
+    return [];
   }
-  const totalDur = Math.max(0.5, cue.endTime - cue.startTime);
+  const safeDur = Math.max(0.2, totalDur);
   const totalChars = rawWords.reduce((sum, w) => sum + Math.max(1, w.length), 0);
 
   return rawWords.map((word) => ({
     word,
-    duration: parseFloat(((totalDur * Math.max(1, word.length)) / totalChars).toFixed(2))
+    duration: parseFloat(((safeDur * Math.max(1, word.length)) / totalChars).toFixed(2))
   }));
+}
+
+/**
+ * Ensures words and durations exist for a cue, dynamically synchronizing when cue.text changes
+ */
+export function ensureCueWords(cue: SubtitleCue): WordTiming[] {
+  const wordsText = (cue.words || []).map(w => w.word).join(' ').trim();
+  const rawText = (cue.text || '').trim();
+
+  // If words array exists and matches the cue text, keep tuned durations
+  if (cue.words && cue.words.length > 0 && wordsText === rawText) {
+    return cue.words;
+  }
+
+  // Otherwise, automatically re-generate words from cue.text so typed text is immediately reflected
+  const totalDur = Math.max(0.2, cue.endTime - cue.startTime);
+  return generateWordsFromText(cue.text || '', totalDur);
 }
 
 export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
@@ -66,23 +80,55 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
 
   const [hasDraftLoaded, setHasDraftLoaded] = useState(false);
   const [cues, setCues] = useState<SubtitleCue[]>(() => {
-    // 1. Try local draft first (prevents lost progress)
+    const trackSubs = track.subtitles || [];
+    let draftSubs: SubtitleCue[] | null = null;
     try {
       const draft = localStorage.getItem(draftKey);
       if (draft) {
         const parsed = JSON.parse(draft);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
+          draftSubs = parsed;
         }
       }
     } catch (e) {}
 
-    // 2. Existing track subtitles
-    if (track.subtitles && track.subtitles.length > 0) {
-      return track.subtitles.map(c => ({
-        ...c,
-        words: ensureCueWords(c)
-      }));
+    // 1. If track has subtitles and they are at least as comprehensive as the draft, use them
+    if (trackSubs.length > 0 && (!draftSubs || trackSubs.length >= draftSubs.length)) {
+      return trackSubs.map(c => {
+        const isPlaceholder = c.text && (c.text.includes('священний рядок') || c.text.includes('Перший священний'));
+        const cleanText = isPlaceholder ? '' : (c.text || '');
+        return {
+          ...c,
+          text: cleanText,
+          words: ensureCueWords({ ...c, text: cleanText })
+        };
+      });
+    }
+
+    // 2. Otherwise use local draft if available
+    if (draftSubs && draftSubs.length > 0) {
+      return draftSubs.map(c => {
+        const isPlaceholder = c.text && (c.text.includes('священний рядок') || c.text.includes('Перший священний'));
+        const cleanText = isPlaceholder ? '' : (c.text || '');
+        return {
+          ...c,
+          text: cleanText,
+          words: ensureCueWords({ ...c, text: cleanText })
+        };
+      });
+    }
+
+    // 3. Fallback to track subtitles if any
+    if (trackSubs.length > 0) {
+      return trackSubs.map(c => {
+        const isPlaceholder = c.text && (c.text.includes('священний рядок') || c.text.includes('Перший священний'));
+        const cleanText = isPlaceholder ? '' : (c.text || '');
+        return {
+          ...c,
+          text: cleanText,
+          words: ensureCueWords({ ...c, text: cleanText })
+        };
+      });
     }
 
     // 3. Auto-generate preliminary cues from lyrics
@@ -119,13 +165,14 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
     const defaultCue: SubtitleCue = {
       id: '1',
       startTime: 0,
-      endTime: 5,
-      text: 'Перший священний рядок сувою...'
+      endTime: 3.5,
+      text: ''
     };
-    defaultCue.words = ensureCueWords(defaultCue);
+    defaultCue.words = [];
     return [defaultCue];
   });
 
+  const [newCueText, setNewCueText] = useState<string>('');
   const [activeCueIdx, setActiveCueIdx] = useState<number>(0);
   const [magneticPush, setMagneticPush] = useState<boolean>(true);
   const [showLyricsModal, setShowLyricsModal] = useState<boolean>(false);
@@ -265,17 +312,29 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
     }
   };
 
-  const handleAddCue = () => {
+  const handleAddCue = (customText?: string) => {
+    const raw = typeof customText === 'string' ? customText : newCueText;
+    const cleanText = raw.trim();
     const last = cues[cues.length - 1];
     const newStart = last ? last.endTime : parseFloat(currentTime.toFixed(2));
+    const newDur = 3.5;
     const newCue: SubtitleCue = {
       id: `cue_${Date.now()}`,
       startTime: parseFloat(newStart.toFixed(2)),
-      endTime: parseFloat((newStart + 3.5).toFixed(2)),
-      text: 'Новий священний рядок...',
+      endTime: parseFloat((newStart + newDur).toFixed(2)),
+      text: cleanText,
+      words: generateWordsFromText(cleanText, newDur),
     };
-    newCue.words = ensureCueWords(newCue);
-    setCues([...cues, newCue]);
+    const updated = [...cues, newCue];
+    setCues(updated);
+    setActiveCueIdx(updated.length - 1);
+    setNewCueText('');
+
+    setTimeout(() => {
+      if (listRef.current) {
+        listRef.current.scrollTop = listRef.current.scrollHeight;
+      }
+    }, 50);
   };
 
   const handleDeleteCue = (idx: number) => {
@@ -405,6 +464,12 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5 shrink-0">
+            <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 bg-black/60 border border-neon-teal/30 rounded-xl text-[10px] font-mono text-gray-300">
+              <span className="text-neon-cyan font-bold">⌨️ Гарячі клавіші:</span>
+              <span>Пробіл = Пауза/Грати</span>
+              <span className="text-gray-500">•</span>
+              <span>← / → = ±5 сек</span>
+            </div>
             <button
               type="button"
               onClick={() => setShowLyricsModal(true)}
@@ -438,15 +503,40 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
           {/* LEFT 1/4 COLUMN: "на тій 1/4 зліва в нас стоять порядковий таймінг" */}
           <div className="w-full lg:w-1/4 xl:w-1/4 min-w-[310px] max-w-full lg:max-w-sm shrink-0 flex flex-col h-full border-b lg:border-b-0 lg:border-r border-neon-teal/25 pb-2 lg:pb-0 lg:pr-3 overflow-hidden">
             {/* Left Header */}
-            <div className="flex items-center justify-between pb-2 mb-2 border-b border-neon-teal/15 shrink-0">
+            <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-neon-teal/15 shrink-0">
               <span className="font-cinzel text-xs font-bold text-neon-cyan flex items-center gap-1.5">
                 <Clock size={13} /> Порядковий таймінг ({cues.length})
               </span>
               <button
                 type="button"
-                onClick={handleAddCue}
-                className="px-2 py-1 bg-neon-cyan/20 hover:bg-neon-cyan text-neon-cyan hover:text-black border border-neon-cyan/40 rounded-lg text-[11px] font-mono font-bold transition-all cursor-pointer flex items-center gap-1"
-                title="Додати новий рядок"
+                onClick={() => handleAddCue('')}
+                className="px-2 py-0.5 bg-neon-cyan/20 hover:bg-neon-cyan text-neon-cyan hover:text-black border border-neon-cyan/40 rounded-lg text-[10px] font-mono font-bold transition-all cursor-pointer flex items-center gap-1"
+                title="Швидко додати порожній рядок"
+              >
+                <Plus size={11} /> + Порожній
+              </button>
+            </div>
+
+            {/* Quick Add Bar: Type text & hit Add or Enter */}
+            <div className="flex items-center gap-1.5 p-1.5 bg-black/60 border border-neon-teal/30 focus-within:border-neon-cyan rounded-xl mb-2 shrink-0 shadow-[0_0_10px_rgba(0,0,0,0.5)]">
+              <input
+                type="text"
+                value={newCueText}
+                onChange={(e) => setNewCueText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleAddCue(newCueText);
+                  }
+                }}
+                placeholder="Введіть текст нового рядка..."
+                className="flex-grow bg-transparent text-xs text-white placeholder-gray-500 focus:outline-none px-1.5 py-0.5"
+              />
+              <button
+                type="button"
+                onClick={() => handleAddCue(newCueText)}
+                className="px-2.5 py-1 bg-neon-cyan text-black font-mono font-bold rounded-lg hover:bg-white text-[11px] transition-all cursor-pointer flex items-center gap-1 shrink-0 shadow-[0_0_8px_#66fcf1]"
+                title="Додати рядок із введеним текстом (або клавіша Enter)"
               >
                 <Plus size={12} /> Додати рядок
               </button>
@@ -531,13 +621,18 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
                       value={cue.text}
                       onClick={(e) => e.stopPropagation()}
                       onChange={(e) => {
+                        const val = e.target.value;
                         const next = [...cues];
-                        next[idx].text = e.target.value;
-                        next[idx].words = ensureCueWords(next[idx]);
+                        const dur = Math.max(0.2, next[idx].endTime - next[idx].startTime);
+                        next[idx] = {
+                          ...next[idx],
+                          text: val,
+                          words: generateWordsFromText(val, dur)
+                        };
                         setCues(next);
                       }}
                       className="w-full bg-black/70 border border-neon-teal/30 focus:border-neon-cyan rounded-lg px-2 py-1 text-xs text-gray-100 font-sans focus:outline-none"
-                      placeholder="Текст рядка..."
+                      placeholder="Введіть слова рядка..."
                     />
 
                     {/* Row 3: Precision 0.01s start/end controls */}
@@ -900,13 +995,15 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
                     type="button"
                     onClick={() => onSeek(Math.max(0, currentTime - 5))}
                     className="px-2 py-0.5 bg-black/60 hover:bg-neon-cyan/20 border border-neon-teal/30 rounded text-neon-cyan cursor-pointer"
+                    title="Перемотати назад на 5 секунд (клавіша ←)"
                   >
-                    -5с
+                    -5с (←)
                   </button>
                   <button
                     type="button"
                     onClick={() => onSeek(Math.max(0, currentTime - 1))}
                     className="px-2 py-0.5 bg-black/60 hover:bg-neon-cyan/20 border border-neon-teal/30 rounded text-neon-cyan cursor-pointer"
+                    title="Перемотати назад на 1 секунду"
                   >
                     -1с
                   </button>
@@ -914,6 +1011,7 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
                     type="button"
                     onClick={() => onSeek(Math.min(totalDuration, currentTime + 1))}
                     className="px-2 py-0.5 bg-black/60 hover:bg-neon-cyan/20 border border-neon-teal/30 rounded text-neon-cyan cursor-pointer"
+                    title="Перемотати вперед на 1 секунду"
                   >
                     +1с
                   </button>
@@ -921,8 +1019,9 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
                     type="button"
                     onClick={() => onSeek(Math.min(totalDuration, currentTime + 5))}
                     className="px-2 py-0.5 bg-black/60 hover:bg-neon-cyan/20 border border-neon-teal/30 rounded text-neon-cyan cursor-pointer"
+                    title="Перемотати вперед на 5 секунд (клавіша →)"
                   >
-                    +5с
+                    +5с (→)
                   </button>
                 </div>
 
@@ -939,9 +1038,10 @@ export const SubtitleStudio: React.FC<SubtitleStudioProps> = ({
                     type="button"
                     onClick={onTogglePlay}
                     className="px-3.5 py-1 bg-neon-cyan text-black font-bold rounded-lg flex items-center gap-1.5 cursor-pointer shadow-[0_0_8px_#66fcf1]"
+                    title="Відтворити / Пауза (клавіша Пробіл)"
                   >
                     {isPlaying ? <Pause size={13} /> : <Play size={13} className="ml-0.5" />}
-                    {isPlaying ? 'Пауза' : 'Грати'}
+                    {isPlaying ? 'Пауза (Space)' : 'Грати (Space)'}
                   </button>
                 </div>
               </div>
