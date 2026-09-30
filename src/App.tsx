@@ -47,11 +47,20 @@ import {
   Download,
   FolderArchive,
   RefreshCw,
-  AlertTriangle
+  AlertTriangle,
+  FileAudio,
+  HardDrive
 } from 'lucide-react';
 import { rulesData as defaultRules, tracksData as defaultTracks, Track, AlphabetItem, DictionaryItem, GrammarItem, SubtitleCue, alphabetData as defaultAlphabet, grammarData as defaultGrammar } from './data';
 import { downloadGitHubUpdateZip, downloadDataTsOnly } from './utils/githubExporter';
 import { SITE_BUILD_VERSION } from './version';
+import {
+  saveAudioToLocalStore,
+  getAudioFromLocalStore,
+  preserveTrackMetadata,
+  getPreservedTracks,
+  removePreservedTrack
+} from './utils/audioStorage';
 import { PvpArena } from './components/PvpArena';
 import { SubtitleStudio } from './components/SubtitleStudio';
 import { AudioWaveVisualizer } from './components/AudioWaveVisualizer';
@@ -160,11 +169,12 @@ export default function App() {
 
   const [newTrack, setNewTrack] = useState({
     title: '',
-    author: '',
+    author: 'Психо-Андрій',
     coAuthor: '',
     description: '',
     url: '',
-    lyrics: ''
+    lyrics: '',
+    filename: ''
   });
   const [newTrackFile, setNewTrackFile] = useState<File | null>(null);
   const [addError, setAddError] = useState('');
@@ -175,10 +185,28 @@ export default function App() {
     artist: '',
     description: '',
     lyrics: '',
-    filename: ''
+    filename: '',
+    url: ''
   });
   const [editAudioFile, setEditAudioFile] = useState<File | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
+
+  const openEditModalForTrack = (track: Track) => {
+    const idx = tracks.findIndex(t => (t.id || t.filename) === (track.id || track.filename));
+    if (idx !== -1) {
+      setCurrentTrackIndex(idx);
+    }
+    setEditTrackData({
+      title: track.title || '',
+      artist: track.author || '',
+      description: track.description || '',
+      lyrics: track.lyrics || '',
+      filename: track.filename || '',
+      url: track.url || ''
+    });
+    setEditAudioFile(null);
+    setIsEditModalOpen(true);
+  };
 
   // Auth & Permissions
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -330,7 +358,14 @@ export default function App() {
         overrides = await fetchTrackOverrides();
       } catch (e) {}
 
-      // Merge local storage overrides & custom tracks
+      // 1. Deleted tracks set (so admin deletion persists)
+      let deletedSet = new Set<string>();
+      try {
+        const deletedArr = JSON.parse(localStorage.getItem('psychoAndriy_deleted_tracks') || '[]');
+        deletedSet = new Set(deletedArr);
+      } catch (e) {}
+
+      // 2. Merge local storage overrides & custom tracks
       let localOverrides: Record<string, any> = {};
       try {
         localOverrides = JSON.parse(localStorage.getItem('psychoAndriy_track_overrides') || '{}');
@@ -347,7 +382,12 @@ export default function App() {
         ...localCustom.filter(lc => !custom.some(c => c.id === lc.id))
       ];
 
-      const defaultMerged: Track[] = defaultTracks.map((dt) => {
+      // 3. Filter default tracks by deletedSet
+      const filteredDefaults = defaultTracks.filter(
+        (dt) => !deletedSet.has(dt.filename) && !deletedSet.has(dt.id || '')
+      );
+
+      const defaultMerged: Track[] = filteredDefaults.map((dt) => {
         const ov = mergedOverrides[dt.filename];
         const cm = combinedCustom.find(
           (c) => c.id === dt.filename || (c.title && c.title.trim().toLowerCase() === dt.title.trim().toLowerCase())
@@ -387,10 +427,16 @@ export default function App() {
       });
 
       const pureCustom: Track[] = combinedCustom
-        .filter((c) => !defaultTracks.some((dt) => dt.filename === c.id || (c.title && dt.title.trim().toLowerCase() === c.title.trim().toLowerCase())))
+        .filter(
+          (c) =>
+            !deletedSet.has(c.id || '') &&
+            !defaultTracks.some(
+              (dt) => dt.filename === c.id || (c.title && dt.title.trim().toLowerCase() === c.title.trim().toLowerCase())
+            )
+        )
         .map((c) => ({
           id: c.id || '',
-          filename: c.id || '',
+          filename: c.filename || c.id || '',
           title: c.title,
           author: c.author,
           coAuthor: c.coAuthor || '',
@@ -404,7 +450,31 @@ export default function App() {
           createdAt: c.createdAt
         }));
 
-      setTracks([...defaultMerged, ...pureCustom]);
+      // 4. Preserved tracks previously listened to by this user!
+      // If a track was removed from GitHub, but the user listened to it, it stays in their local library!
+      let preservedList: any[] = [];
+      try {
+        preservedList = await getPreservedTracks();
+      } catch (e) {}
+
+      const retainedTracks: Track[] = [];
+      for (const pt of preservedList) {
+        const pKey = pt.id || pt.filename;
+        if (!pKey || deletedSet.has(pKey)) continue;
+        const existsInDefault = defaultMerged.some(
+          (d) => (d.id || d.filename) === pKey || d.title?.trim().toLowerCase() === pt.title?.trim().toLowerCase()
+        );
+        const existsInCustom = pureCustom.some((c) => (c.id || c.filename) === pKey);
+        if (!existsInDefault && !existsInCustom) {
+          retainedTracks.push({
+            ...pt,
+            id: pt.id || pt.filename,
+            isCustom: pt.isCustom ?? false
+          });
+        }
+      }
+
+      setTracks([...defaultMerged, ...pureCustom, ...retainedTracks]);
     } catch (err) {
       console.warn('Tracks loaded with fallback:', err);
     }
@@ -572,56 +642,73 @@ export default function App() {
       setIsSynthesizing(true);
       const key = currentTrack.id || currentTrack.filename || currentTrack.title;
       try {
+        // 1. In-memory synthesizer / URL cache
         if (synthCache.current[key]) {
           setResolvedAudioUrl(synthCache.current[key]);
           setIsSynthesizing(false);
+          preserveTrackMetadata(currentTrack);
           return;
         }
 
+        // 2. Persistent IndexedDB cache (instant playback, zero network request, offline ready)
+        try {
+          const cachedBlob = await getAudioFromLocalStore(key);
+          if (cachedBlob && cachedBlob.size > 1000) {
+            if (isCancelled) return;
+            const blobUrl = URL.createObjectURL(cachedBlob);
+            synthCache.current[key] = blobUrl;
+            setResolvedAudioUrl(blobUrl);
+            setIsSynthesizing(false);
+            preserveTrackMetadata(currentTrack);
+            return;
+          }
+        } catch (e) {}
+
+        // 3. Custom audio file from Firestore
         if (currentTrack.hasFile) {
           try {
             const trackId = currentTrack.id || currentTrack.filename;
             const blob = await fetchTrackAudioBlobFromFirestore(trackId, currentTrack.fileType);
             if (isCancelled) return;
+            await saveAudioToLocalStore(key, blob);
             const blobUrl = URL.createObjectURL(blob);
             synthCache.current[key] = blobUrl;
             setResolvedAudioUrl(blobUrl);
             setIsSynthesizing(false);
+            preserveTrackMetadata(currentTrack);
             return;
           } catch (e) {}
         }
 
-        if (currentTrack.url && (currentTrack.url.startsWith('http://') || currentTrack.url.startsWith('https://'))) {
-          const formatted = formatAudioUrl(currentTrack.url);
-          if (formatted) {
-            setResolvedAudioUrl(formatted);
-            setIsSynthesizing(false);
-            return;
-          }
-        }
-
-        if (currentTrack.url && !currentTrack.url.startsWith('db://')) {
+        // 4. Remote HTTP URL or relative music/ path
+        const targetUrl = currentTrack.url || (currentTrack.filename ? `music/${currentTrack.filename}` : '');
+        if (targetUrl && !targetUrl.startsWith('db://')) {
           try {
-            const testResp = await fetch(currentTrack.url, { method: 'HEAD' });
-            const cl = testResp.headers.get('content-length');
-            if (testResp.ok && (!cl || parseInt(cl, 10) > 1000)) {
-              setResolvedAudioUrl(currentTrack.url);
-              setIsSynthesizing(false);
-              return;
+            const resp = await fetch(targetUrl);
+            if (resp.ok) {
+              const blob = await resp.blob();
+              if (blob.size > 1000) {
+                if (isCancelled) return;
+                await saveAudioToLocalStore(key, blob);
+                const blobUrl = URL.createObjectURL(blob);
+                synthCache.current[key] = blobUrl;
+                setResolvedAudioUrl(blobUrl);
+                setIsSynthesizing(false);
+                preserveTrackMetadata(currentTrack);
+                return;
+              }
             }
           } catch (e) {
-            if (currentTrack.url.startsWith('music/')) {
-              setResolvedAudioUrl(currentTrack.url);
-              setIsSynthesizing(false);
-              return;
-            }
+            console.warn('[Audio] Could not fetch audio from URL, falling back to synth:', e);
           }
         }
 
+        // 5. Atmospheric Dark Folk procedural synthesizer
         const synthUrl = await generateDarkFolkAudio(currentTrack.title, key);
         if (isCancelled) return;
         synthCache.current[key] = synthUrl;
         setResolvedAudioUrl(synthUrl);
+        preserveTrackMetadata(currentTrack);
       } catch (err) {
         if (!isCancelled) {
           setResolvedAudioUrl(undefined);
@@ -644,9 +731,9 @@ export default function App() {
         artist: currentTrack.author || '',
         description: currentTrack.description || '',
         lyrics: currentTrack.lyrics || '',
-        filename: currentTrack.filename || ''
+        filename: currentTrack.filename || '',
+        url: currentTrack.url || ''
       });
-      setIsEditModalOpen(false);
     }
   }, [currentTrackIndex, tracks]);
 
@@ -942,14 +1029,23 @@ export default function App() {
         fileType = newTrackFile.type || 'audio/mpeg';
       }
       const trackId = `custom-${Date.now()}`;
+      const rawFn = (newTrack.filename || '').trim();
+      const customFilename = rawFn
+        ? (rawFn.toLowerCase().endsWith('.mp3') ? rawFn : `${rawFn}.mp3`)
+        : (newTrackFile?.name || `${trackId}.mp3`);
+
+      const customUrl = newTrack.url?.trim()
+        ? newTrack.url.trim()
+        : (newTrackFile ? URL.createObjectURL(newTrackFile) : `music/${customFilename}`);
+
       const newCustomTrack: Track = {
         id: trackId,
-        filename: newTrackFile?.name || `${trackId}.mp3`,
+        filename: customFilename,
         title: newTrack.title,
         author: newTrack.author,
         coAuthor: newTrack.coAuthor,
         description: newTrack.description,
-        url: newTrack.url || (newTrackFile ? URL.createObjectURL(newTrackFile) : ''),
+        url: customUrl,
         lyrics: newTrack.lyrics,
         isCustom: true,
         hasFile: !!newTrackFile,
@@ -963,6 +1059,13 @@ export default function App() {
       } catch (e) {}
       localCustom.push(newCustomTrack);
       localStorage.setItem('psychoAndriy_custom_tracks', JSON.stringify(localCustom));
+
+      // Preserve metadata and audio locally
+      await preserveTrackMetadata(newCustomTrack);
+      if (newTrackFile) {
+        await saveAudioToLocalStore(trackId, newTrackFile);
+      }
+
       localStorage.setItem('andrelf_has_local_edits', 'true');
       localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
       setHasLocalEdits(true);
@@ -970,11 +1073,12 @@ export default function App() {
       setTracks(prev => [...prev, newCustomTrack]);
       setNewTrack({
         title: '',
-        author: '',
+        author: 'Психо-Андрій',
         coAuthor: '',
         description: '',
         url: '',
-        lyrics: ''
+        lyrics: '',
+        filename: ''
       });
       setNewTrackFile(null);
       setShowAddForm(false);
@@ -987,7 +1091,8 @@ export default function App() {
             author: newTrack.author,
             coAuthor: newTrack.coAuthor,
             description: newTrack.description,
-            url: newTrack.url,
+            url: customUrl,
+            filename: customFilename,
             lyrics: newTrack.lyrics,
             hasFile: !!newTrackFile,
             fileType
@@ -1011,13 +1116,29 @@ export default function App() {
       message: 'Ви дійсно бажаєте вилучити цей сувій з бібліотеки культу?',
       onConfirm: async () => {
         try {
+          // 1. Remove from local custom tracks
           let localCustom: Track[] = [];
           try {
             localCustom = JSON.parse(localStorage.getItem('psychoAndriy_custom_tracks') || '[]');
           } catch (e) {}
           localCustom = localCustom.filter(t => (t.id || t.filename) !== trackId);
           localStorage.setItem('psychoAndriy_custom_tracks', JSON.stringify(localCustom));
+
+          // 2. Add to deleted tracks list so defaultTracks don't bring it back
+          let deletedArr: string[] = [];
+          try {
+            deletedArr = JSON.parse(localStorage.getItem('psychoAndriy_deleted_tracks') || '[]');
+          } catch (e) {}
+          if (!deletedArr.includes(trackId)) {
+            deletedArr.push(trackId);
+          }
+          localStorage.setItem('psychoAndriy_deleted_tracks', JSON.stringify(deletedArr));
+
+          // 3. Remove from preserved local store
+          await removePreservedTrack(trackId);
+
           localStorage.setItem('andrelf_has_local_edits', 'true');
+          localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
           setHasLocalEdits(true);
 
           setTracks(prev => prev.filter(t => (t.id || t.filename) !== trackId));
@@ -1039,9 +1160,11 @@ export default function App() {
       const cleanFilename = rawFilename
         ? (rawFilename.toLowerCase().endsWith('.mp3') ? rawFilename : `${rawFilename}.mp3`)
         : (currentTrack.filename || 'track.mp3');
-      const updatedUrl = (!currentTrack.url || currentTrack.url.startsWith('music/'))
-        ? `music/${cleanFilename}`
-        : currentTrack.url;
+      const updatedUrl = editTrackData.url?.trim()
+        ? editTrackData.url.trim()
+        : (!currentTrack.url || currentTrack.url.startsWith('music/'))
+          ? `music/${cleanFilename}`
+          : currentTrack.url;
 
       if (editAudioFile) {
         try {
@@ -1050,6 +1173,7 @@ export default function App() {
         const newUrl = URL.createObjectURL(editAudioFile);
         synthCache.current[trackId] = newUrl;
         setResolvedAudioUrl(newUrl);
+        await saveAudioToLocalStore(trackId, editAudioFile);
         setEditAudioFile(null);
       }
 
@@ -1073,17 +1197,22 @@ export default function App() {
       localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
       setHasLocalEdits(true);
 
+      const updatedTrack: Track = {
+        ...currentTrack,
+        title: editTrackData.title,
+        author: editTrackData.artist,
+        description: editTrackData.description,
+        lyrics: editTrackData.lyrics,
+        filename: cleanFilename,
+        url: updatedUrl
+      };
+
+      // Preserve updated track in local store
+      await preserveTrackMetadata(updatedTrack);
+
       const nextTracks = tracks.map((t) => {
         if ((t.id || t.filename) === trackId) {
-          return {
-            ...t,
-            title: editTrackData.title,
-            author: editTrackData.artist,
-            description: editTrackData.description,
-            lyrics: editTrackData.lyrics,
-            filename: cleanFilename,
-            url: updatedUrl
-          };
+          return updatedTrack;
         }
         return t;
       });
@@ -2098,12 +2227,14 @@ export default function App() {
                         <Scroll size={13} /> Текст пісні
                       </button>
                     )}
-                    <button
-                      onClick={() => setIsEditModalOpen(true)}
-                      className="px-3 py-1.5 bg-black/60 border border-neon-teal/40 hover:border-neon-cyan text-gray-300 hover:text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
-                    >
-                      <PenLine size={13} /> Редагувати
-                    </button>
+                    {(isLocalAdmin || currentUser) && (
+                      <button
+                        onClick={() => openEditModalForTrack(currentTrack)}
+                        className="px-3 py-1.5 bg-black/60 border border-neon-teal/40 hover:border-neon-cyan text-gray-300 hover:text-white rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
+                      >
+                        <PenLine size={13} /> Редагувати
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2179,6 +2310,34 @@ export default function App() {
                   </div>
 
                   <div>
+                    <label className="block text-xs font-mono text-gray-300 mb-1 flex items-center justify-between">
+                      <span className="flex items-center gap-1.5 font-bold text-neon-cyan">
+                        <FileAudio size={14} /> Назва аудіофайлу (.mp3)
+                      </span>
+                      <span className="text-[10px] text-neon-teal font-mono">наприклад: andr.mp3</span>
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="andr.mp3"
+                        value={newTrack.filename}
+                        onChange={(e) => setNewTrack(prev => ({ ...prev, filename: e.target.value }))}
+                        className="flex-grow bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-sm text-gray-100 focus:outline-none font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setNewTrack(prev => ({ ...prev, filename: 'andr.mp3' }))}
+                        className="px-2.5 py-1 text-xs bg-neon-teal/15 hover:bg-neon-teal/30 text-neon-cyan border border-neon-teal/30 rounded-lg cursor-pointer shrink-0 font-mono transition-colors"
+                      >
+                        Вставити andr.mp3
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-gray-400 mt-1 font-mono">
+                      Вкажіть точну назву .mp3 файлу (наприклад, <code className="text-neon-cyan">andr.mp3</code>), якщо файл завантажується в папку <code className="text-neon-cyan">public/music/</code> на GitHub.
+                    </p>
+                  </div>
+
+                  <div>
                     <label className="block text-xs font-mono text-gray-400 mb-1">Аудіо файл або URL</label>
                     <div className="flex items-center gap-3">
                       <label className="px-4 py-2 bg-black/80 border border-dashed border-neon-teal/50 hover:border-neon-cyan text-neon-cyan rounded-lg text-xs cursor-pointer flex items-center gap-2">
@@ -2234,8 +2393,8 @@ export default function App() {
                     <div
                       key={t.id || t.filename || idx}
                       onClick={() => {
+                        // Select the track to inspect details and read without auto-playing
                         setCurrentTrackIndex(originalIdx);
-                        setIsPlaying(true);
                         playSfx('click');
                       }}
                       className={`flex items-center justify-between p-3 sm:p-4 rounded-xl border transition-all cursor-pointer ${
@@ -2253,9 +2412,16 @@ export default function App() {
                           )}
                         </span>
                         <div className="overflow-hidden">
-                          <h4 className={`text-sm sm:text-base font-bold truncate ${isCurrent ? 'text-neon-cyan' : 'text-gray-200'}`}>
-                            {runicMode ? ukrainianToDybriv(t.title) : t.title}
-                          </h4>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <h4 className={`text-sm sm:text-base font-bold truncate ${isCurrent ? 'text-neon-cyan' : 'text-gray-200'}`}>
+                              {runicMode ? ukrainianToDybriv(t.title) : t.title}
+                            </h4>
+                            {t.filename && (
+                              <span className="font-mono text-[10px] text-neon-teal/70 bg-black/60 px-1.5 py-0.5 rounded border border-neon-teal/20 shrink-0">
+                                {t.filename}
+                              </span>
+                            )}
+                          </div>
                           <p className="text-xs text-gray-400 font-mono truncate">
                             {t.author} {t.coAuthor && `• ${t.coAuthor}`}
                           </p>
@@ -2263,21 +2429,49 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0">
-                        {t.isCustom && (
-                          <button
-                            onClick={(e) => handleDeleteTrack(t.id || t.filename, e)}
-                            className="p-1.5 text-gray-500 hover:text-red-400 rounded-lg transition-colors cursor-pointer"
-                            title="Видалити сувій"
-                          >
-                            <Trash2 size={15} />
-                          </button>
+                        {/* Admin actions: Edit & Trash (ONLY visible in admin mode) */}
+                        {(isLocalAdmin || currentUser) && (
+                          <div className="flex items-center gap-1 bg-black/40 border border-neon-teal/20 rounded-lg p-0.5">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditModalForTrack(t);
+                              }}
+                              className="p-1.5 text-gray-400 hover:text-neon-cyan hover:bg-neon-teal/10 rounded transition-colors cursor-pointer"
+                              title="Редагувати сувій / назву аудіофайлу"
+                            >
+                              <PenLine size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => handleDeleteTrack(t.id || t.filename, e)}
+                              className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors cursor-pointer"
+                              title="Видалити сувій з бібліотеки"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
                         )}
+
+                        {/* Play / Pause button */}
                         <button
-                          className={`w-8 h-8 rounded-full flex items-center justify-center border transition-all ${
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (isCurrent) {
+                              setIsPlaying(!isPlaying);
+                            } else {
+                              setCurrentTrackIndex(originalIdx);
+                              setIsPlaying(true);
+                            }
+                          }}
+                          className={`w-9 h-9 rounded-full flex items-center justify-center border transition-all cursor-pointer ${
                             isCurrent && isPlaying
-                              ? 'bg-neon-cyan text-black border-neon-cyan'
-                              : 'border-neon-teal/40 text-neon-cyan hover:border-neon-cyan'
+                              ? 'bg-neon-cyan text-black border-neon-cyan shadow-[0_0_12px_#66fcf1]'
+                              : 'border-neon-teal/40 text-neon-cyan hover:border-neon-cyan hover:bg-neon-teal/20'
                           }`}
+                          title={isCurrent && isPlaying ? "Пауза" : "Слухати сувій"}
                         >
                           {isCurrent && isPlaying ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
                         </button>
@@ -2927,21 +3121,51 @@ export default function App() {
               />
             </div>
             <div>
-              <label className="block text-xs font-mono text-gray-400 mb-1 flex items-center justify-between">
-                <span>Назва аудіофайлу (в папці public/music)</span>
+              <label className="block text-xs font-mono text-gray-300 mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1.5 font-bold text-neon-cyan">
+                  <FileAudio size={14} /> Назва аудіофайлу (.mp3)
+                </span>
                 <span className="text-[10px] text-neon-teal font-mono">наприклад: andr.mp3</span>
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="andr.mp3"
+                  value={editTrackData.filename}
+                  onChange={(e) => setEditTrackData(prev => ({ ...prev, filename: e.target.value }))}
+                  className="flex-grow bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-sm text-gray-100 focus:outline-none font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setEditTrackData(prev => ({ ...prev, filename: 'andr.mp3' }))}
+                  className="px-2.5 py-1 text-xs bg-neon-teal/15 hover:bg-neon-teal/30 text-neon-cyan border border-neon-teal/30 rounded-lg cursor-pointer shrink-0 font-mono transition-colors"
+                  title="Швидко вставити andr.mp3"
+                >
+                  Вставити andr.mp3
+                </button>
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1 font-mono">
+                Вкажіть точну назву .mp3 файлу (наприклад, <code className="text-neon-cyan">andr.mp3</code>), щоб трек зчитувався з папки <code className="text-neon-cyan">public/music/</code> на GitHub.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-mono text-gray-400 mb-1 flex items-center justify-between">
+                <span>Або пряме посилання на аудіо (URL / Хмара)</span>
+                <span className="text-[10px] text-gray-500 font-mono">опціонально</span>
               </label>
               <input
                 type="text"
-                placeholder="andr.mp3"
-                value={editTrackData.filename}
-                onChange={(e) => setEditTrackData(prev => ({ ...prev, filename: e.target.value }))}
-                className="w-full bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-sm text-gray-100 focus:outline-none font-mono"
+                placeholder="https://... або залиште порожнім для public/music/"
+                value={editTrackData.url || ''}
+                onChange={(e) => setEditTrackData(prev => ({ ...prev, url: e.target.value }))}
+                className="w-full bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-xs text-gray-100 focus:outline-none font-mono"
               />
               <p className="text-[10px] text-gray-400 mt-1 font-mono">
-                Вкажіть точну назву .mp3 файлу (наприклад, <code className="text-neon-cyan">andr.mp3</code>), щоб трек зчитувався з папки <code className="text-neon-cyan">public/music/</code>.
+                💡 Якщо музика багато важить і не поміщається на GitHub, ви можете зберігати аудіо в хмарі та вставити пряме посилання сюди.
               </p>
             </div>
+
             <div>
               <label className="block text-xs font-mono text-gray-400 mb-1">Автор</label>
               <input
@@ -2968,6 +3192,13 @@ export default function App() {
                 onChange={(e) => setEditTrackData(prev => ({ ...prev, lyrics: e.target.value }))}
                 className="w-full bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-xs text-gray-100 focus:outline-none"
               />
+            </div>
+
+            <div className="bg-black/50 border border-neon-teal/20 rounded-xl p-3 text-[11px] font-mono text-gray-300 flex items-center gap-2">
+              <HardDrive size={16} className="text-neon-cyan shrink-0" />
+              <span>
+                💾 Сувій автоматично зберігається в локальну пам&apos;ять браузера (IndexedDB) при прослуховуванні. Якщо пісня пропаде з GitHub, вона залишиться у вас у бібліотеці!
+              </span>
             </div>
 
             <div className="flex justify-end gap-3 pt-2">
