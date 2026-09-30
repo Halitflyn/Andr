@@ -1,0 +1,8 @@
+{
+  "name": "Andrelf - Культ Психо-Андрія",
+  "description": "Сайт культу Психо-Андрія, Ельфа Асасіна з Дібрівських лісів: священні правила, вініловий плеєр, капкат субтитрів, перекладач рун та ПвП арена.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
