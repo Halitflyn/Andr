@@ -43,9 +43,15 @@ import {
   FileText,
   RotateCcw,
   Sparkle,
-  Share2
+  Share2,
+  Download,
+  FolderArchive,
+  RefreshCw,
+  AlertTriangle
 } from 'lucide-react';
 import { rulesData as defaultRules, tracksData as defaultTracks, Track, AlphabetItem, DictionaryItem, GrammarItem, SubtitleCue, alphabetData as defaultAlphabet, grammarData as defaultGrammar } from './data';
+import { downloadGitHubUpdateZip, downloadDataTsOnly } from './utils/githubExporter';
+import { SITE_BUILD_VERSION } from './version';
 import { PvpArena } from './components/PvpArena';
 import { SubtitleStudio } from './components/SubtitleStudio';
 import { AudioWaveVisualizer } from './components/AudioWaveVisualizer';
@@ -168,7 +174,8 @@ export default function App() {
     title: '',
     artist: '',
     description: '',
-    lyrics: ''
+    lyrics: '',
+    filename: ''
   });
   const [editAudioFile, setEditAudioFile] = useState<File | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
@@ -176,6 +183,27 @@ export default function App() {
   // Auth & Permissions
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [currentAdminName, setCurrentAdminName] = useState<string | null>(null);
+  const [isLocalAdmin, setIsLocalAdmin] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('andrelf_is_admin') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [hasLocalEdits, setHasLocalEdits] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('andrelf_has_local_edits') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [showSiteUpdatedModal, setShowSiteUpdatedModal] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Secret 5-clicks tracker
+  const adminClickCount = useRef(0);
+  const lastAdminClickTime = useRef(0);
+
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authError, setAuthError] = useState('');
   const [resolvedAudioUrl, setResolvedAudioUrl] = useState<string | undefined>(undefined);
@@ -295,17 +323,40 @@ export default function App() {
 
   const loadTracks = useCallback(async () => {
     try {
-      const custom = await fetchCustomTracksFromFirestore();
-      const overrides = await fetchTrackOverrides();
+      let custom: any[] = [];
+      let overrides: Record<string, any> = {};
+      try {
+        custom = await fetchCustomTracksFromFirestore();
+        overrides = await fetchTrackOverrides();
+      } catch (e) {}
+
+      // Merge local storage overrides & custom tracks
+      let localOverrides: Record<string, any> = {};
+      try {
+        localOverrides = JSON.parse(localStorage.getItem('psychoAndriy_track_overrides') || '{}');
+      } catch (e) {}
+
+      let localCustom: Track[] = [];
+      try {
+        localCustom = JSON.parse(localStorage.getItem('psychoAndriy_custom_tracks') || '[]');
+      } catch (e) {}
+
+      const mergedOverrides = { ...overrides, ...localOverrides };
+      const combinedCustom = [
+        ...custom,
+        ...localCustom.filter(lc => !custom.some(c => c.id === lc.id))
+      ];
+
       const defaultMerged: Track[] = defaultTracks.map((dt) => {
-        const ov = overrides[dt.filename];
-        const cm = custom.find(
+        const ov = mergedOverrides[dt.filename];
+        const cm = combinedCustom.find(
           (c) => c.id === dt.filename || (c.title && c.title.trim().toLowerCase() === dt.title.trim().toLowerCase())
         );
         let trk: Track = { id: dt.filename, isCustom: false, hasFile: false, fileType: 'audio/mpeg', ...dt };
         if (ov) {
           trk = {
             ...trk,
+            filename: ov.filename || trk.filename,
             title: ov.title || trk.title,
             author: ov.artist || trk.author,
             description: ov.description || trk.description,
@@ -335,7 +386,7 @@ export default function App() {
         return trk;
       });
 
-      const pureCustom: Track[] = custom
+      const pureCustom: Track[] = combinedCustom
         .filter((c) => !defaultTracks.some((dt) => dt.filename === c.id || (c.title && dt.title.trim().toLowerCase() === c.title.trim().toLowerCase())))
         .map((c) => ({
           id: c.id || '',
@@ -361,6 +412,16 @@ export default function App() {
 
   const loadRules = useCallback(async () => {
     try {
+      const localRules = localStorage.getItem('psychoAndriy_rules');
+      if (localRules) {
+        try {
+          const parsed = JSON.parse(localRules);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setRules(parsed);
+            return;
+          }
+        } catch (e) {}
+      }
       const r = await fetchRulesFromFirestore(defaultRules);
       if (r && r.length > 0) setRules(r);
     } catch (err) {}
@@ -368,6 +429,16 @@ export default function App() {
 
   const loadAlphabet = useCallback(async () => {
     try {
+      const localAlpha = localStorage.getItem('psychoAndriy_alphabet');
+      if (localAlpha) {
+        try {
+          const parsed = JSON.parse(localAlpha);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setAlphabet(parsed);
+            return;
+          }
+        } catch (e) {}
+      }
       const a = await fetchAlphabetFromFirestore();
       if (a && a.length > 0) setAlphabet(a);
     } catch (err) {}
@@ -375,13 +446,33 @@ export default function App() {
 
   const loadDictionary = useCallback(async () => {
     try {
+      let localDict: DictionaryItem[] = [];
+      try {
+        localDict = JSON.parse(localStorage.getItem('psychoAndriy_dictionary') || '[]');
+      } catch (e) {}
       const d = await fetchDictionaryFromFirestore();
-      setDictionary(d);
-    } catch (err) {}
+      const combined = [...d, ...localDict.filter(ld => !d.some(x => x.word === ld.word))];
+      setDictionary(combined);
+    } catch (err) {
+      try {
+        const localDict = JSON.parse(localStorage.getItem('psychoAndriy_dictionary') || '[]');
+        if (localDict.length > 0) setDictionary(localDict);
+      } catch (e) {}
+    }
   }, []);
 
   const loadGrammar = useCallback(async () => {
     try {
+      const localGram = localStorage.getItem('psychoAndriy_grammar');
+      if (localGram) {
+        try {
+          const parsed = JSON.parse(localGram);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setGrammar(parsed);
+            return;
+          }
+        } catch (e) {}
+      }
       const g = await fetchGrammarFromFirestore();
       if (g && g.length > 0) setGrammar(g);
     } catch (err) {}
@@ -434,6 +525,13 @@ export default function App() {
     loadAlphabet();
     loadDictionary();
     loadGrammar();
+
+    // Check if site was updated in repository and user has local drafts
+    const localEditsExist = localStorage.getItem('andrelf_has_local_edits') === 'true';
+    const ackVersion = localStorage.getItem('andrelf_acknowledged_version');
+    if (localEditsExist && ackVersion !== String(SITE_BUILD_VERSION)) {
+      setShowSiteUpdatedModal(true);
+    }
 
     return () => unsubscribe();
   }, [loadTracks, loadRules, loadAlphabet, loadDictionary, loadGrammar]);
@@ -506,12 +604,18 @@ export default function App() {
           try {
             const testResp = await fetch(currentTrack.url, { method: 'HEAD' });
             const cl = testResp.headers.get('content-length');
-            if (testResp.ok && cl && parseInt(cl, 10) > 1000) {
+            if (testResp.ok && (!cl || parseInt(cl, 10) > 1000)) {
               setResolvedAudioUrl(currentTrack.url);
               setIsSynthesizing(false);
               return;
             }
-          } catch (e) {}
+          } catch (e) {
+            if (currentTrack.url.startsWith('music/')) {
+              setResolvedAudioUrl(currentTrack.url);
+              setIsSynthesizing(false);
+              return;
+            }
+          }
         }
 
         const synthUrl = await generateDarkFolkAudio(currentTrack.title, key);
@@ -539,7 +643,8 @@ export default function App() {
         title: currentTrack.title || '',
         artist: currentTrack.author || '',
         description: currentTrack.description || '',
-        lyrics: currentTrack.lyrics || ''
+        lyrics: currentTrack.lyrics || '',
+        filename: currentTrack.filename || ''
       });
       setIsEditModalOpen(false);
     }
@@ -836,20 +941,33 @@ export default function App() {
       if (newTrackFile) {
         fileType = newTrackFile.type || 'audio/mpeg';
       }
-      await saveTrackToFirestore(
-        {
-          title: newTrack.title,
-          author: newTrack.author,
-          coAuthor: newTrack.coAuthor,
-          description: newTrack.description,
-          url: newTrack.url,
-          lyrics: newTrack.lyrics,
-          hasFile: !!newTrackFile,
-          fileType
-        },
-        newTrackFile || undefined
-      );
+      const trackId = `custom-${Date.now()}`;
+      const newCustomTrack: Track = {
+        id: trackId,
+        filename: newTrackFile?.name || `${trackId}.mp3`,
+        title: newTrack.title,
+        author: newTrack.author,
+        coAuthor: newTrack.coAuthor,
+        description: newTrack.description,
+        url: newTrack.url || (newTrackFile ? URL.createObjectURL(newTrackFile) : ''),
+        lyrics: newTrack.lyrics,
+        isCustom: true,
+        hasFile: !!newTrackFile,
+        fileType
+      };
 
+      // Save to localStorage
+      let localCustom: Track[] = [];
+      try {
+        localCustom = JSON.parse(localStorage.getItem('psychoAndriy_custom_tracks') || '[]');
+      } catch (e) {}
+      localCustom.push(newCustomTrack);
+      localStorage.setItem('psychoAndriy_custom_tracks', JSON.stringify(localCustom));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
+      setHasLocalEdits(true);
+
+      setTracks(prev => [...prev, newCustomTrack]);
       setNewTrack({
         title: '',
         author: '',
@@ -860,8 +978,25 @@ export default function App() {
       });
       setNewTrackFile(null);
       setShowAddForm(false);
-      await loadTracks();
       showToast('Новий священний сувій успішно збережено!', 'success');
+
+      try {
+        await saveTrackToFirestore(
+          {
+            title: newTrack.title,
+            author: newTrack.author,
+            coAuthor: newTrack.coAuthor,
+            description: newTrack.description,
+            url: newTrack.url,
+            lyrics: newTrack.lyrics,
+            hasFile: !!newTrackFile,
+            fileType
+          },
+          newTrackFile || undefined
+        );
+      } catch (err: any) {
+        console.warn('Firestore sync failed, local copy saved:', err);
+      }
     } catch (err: any) {
       setAddError(`Помилка створення сувою: ${err.message || err.toString()}`);
     } finally {
@@ -876,9 +1011,20 @@ export default function App() {
       message: 'Ви дійсно бажаєте вилучити цей сувій з бібліотеки культу?',
       onConfirm: async () => {
         try {
-          await deleteTrackFromFirestore(trackId);
+          let localCustom: Track[] = [];
+          try {
+            localCustom = JSON.parse(localStorage.getItem('psychoAndriy_custom_tracks') || '[]');
+          } catch (e) {}
+          localCustom = localCustom.filter(t => (t.id || t.filename) !== trackId);
+          localStorage.setItem('psychoAndriy_custom_tracks', JSON.stringify(localCustom));
+          localStorage.setItem('andrelf_has_local_edits', 'true');
+          setHasLocalEdits(true);
+
+          setTracks(prev => prev.filter(t => (t.id || t.filename) !== trackId));
           showToast('Сувій вилучено з бібліотеки.', 'info');
-          await loadTracks();
+          try {
+            await deleteTrackFromFirestore(trackId);
+          } catch (err) {}
         } catch (err) {}
       }
     });
@@ -889,35 +1035,87 @@ export default function App() {
     setIsSavingEdit(true);
     try {
       const trackId = currentTrack.id || currentTrack.filename;
+      const rawFilename = (editTrackData.filename || '').trim();
+      const cleanFilename = rawFilename
+        ? (rawFilename.toLowerCase().endsWith('.mp3') ? rawFilename : `${rawFilename}.mp3`)
+        : (currentTrack.filename || 'track.mp3');
+      const updatedUrl = (!currentTrack.url || currentTrack.url.startsWith('music/'))
+        ? `music/${cleanFilename}`
+        : currentTrack.url;
+
       if (editAudioFile) {
-        await updateTrackAudioAndMetadata(trackId, editAudioFile, !!currentTrack.isCustom);
+        try {
+          await updateTrackAudioAndMetadata(trackId, editAudioFile, !!currentTrack.isCustom);
+        } catch (e) {}
         const newUrl = URL.createObjectURL(editAudioFile);
         synthCache.current[trackId] = newUrl;
         setResolvedAudioUrl(newUrl);
         setEditAudioFile(null);
       }
-      if (currentTrack.isCustom) {
-        await updateTrackInFirestore(currentTrack.id!, {
-          title: editTrackData.title,
-          author: editTrackData.artist,
-          description: editTrackData.description,
-          lyrics: editTrackData.lyrics,
-          hasFile: editAudioFile ? true : currentTrack.hasFile,
-          fileType: editAudioFile ? editAudioFile.type || 'audio/mpeg' : currentTrack.fileType
-        });
-      } else {
-        await saveTrackOverride(trackId, {
-          title: editTrackData.title,
-          artist: editTrackData.artist,
-          description: editTrackData.description,
-          lyrics: editTrackData.lyrics,
-          hasFile: editAudioFile ? true : currentTrack.hasFile,
-          fileType: editAudioFile ? editAudioFile.type || 'audio/mpeg' : currentTrack.fileType
-        });
-      }
+
+      // Save to localStorage overrides
+      let overrides: Record<string, any> = {};
+      try {
+        overrides = JSON.parse(localStorage.getItem('psychoAndriy_track_overrides') || '{}');
+      } catch (e) {}
+      overrides[trackId] = {
+        title: editTrackData.title,
+        artist: editTrackData.artist,
+        description: editTrackData.description,
+        lyrics: editTrackData.lyrics,
+        filename: cleanFilename,
+        url: updatedUrl,
+        hasFile: editAudioFile ? true : currentTrack.hasFile,
+        fileType: editAudioFile ? editAudioFile.type || 'audio/mpeg' : currentTrack.fileType
+      };
+      localStorage.setItem('psychoAndriy_track_overrides', JSON.stringify(overrides));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
+      setHasLocalEdits(true);
+
+      const nextTracks = tracks.map((t) => {
+        if ((t.id || t.filename) === trackId) {
+          return {
+            ...t,
+            title: editTrackData.title,
+            author: editTrackData.artist,
+            description: editTrackData.description,
+            lyrics: editTrackData.lyrics,
+            filename: cleanFilename,
+            url: updatedUrl
+          };
+        }
+        return t;
+      });
+      setTracks(nextTracks);
       setIsEditModalOpen(false);
-      await loadTracks();
       showToast('Деталі сувою успішно оновлено!', 'success');
+
+      try {
+        if (currentTrack.isCustom) {
+          await updateTrackInFirestore(currentTrack.id!, {
+            title: editTrackData.title,
+            author: editTrackData.artist,
+            description: editTrackData.description,
+            lyrics: editTrackData.lyrics,
+            filename: cleanFilename,
+            url: updatedUrl,
+            hasFile: editAudioFile ? true : currentTrack.hasFile,
+            fileType: editAudioFile ? editAudioFile.type || 'audio/mpeg' : currentTrack.fileType
+          });
+        } else {
+          await saveTrackOverride(trackId, {
+            title: editTrackData.title,
+            artist: editTrackData.artist,
+            description: editTrackData.description,
+            lyrics: editTrackData.lyrics,
+            filename: cleanFilename,
+            url: updatedUrl,
+            hasFile: editAudioFile ? true : currentTrack.hasFile,
+            fileType: editAudioFile ? editAudioFile.type || 'audio/mpeg' : currentTrack.fileType
+          });
+        }
+      } catch (e) {}
     } catch (err) {
       showToast('Не вдалося оновити сувій', 'error');
     } finally {
@@ -968,12 +1166,36 @@ export default function App() {
     setEditRulesList(updated);
   };
 
+  const resetRulesToDefault = () => {
+    setConfirmDialog({
+      title: 'Скинути священні правила',
+      message: 'Відновити початкові священні правила культу за замовчуванням?',
+      onConfirm: async () => {
+        setEditRulesList([...defaultRules]);
+        setRules([...defaultRules]);
+        try {
+          localStorage.removeItem('psychoAndriy_rules');
+          await saveRulesToFirestore(defaultRules);
+        } catch (e) {}
+        showToast('Правила відновлено до початкового канону!', 'info');
+      }
+    });
+  };
+
   const handleSaveRules = async () => {
     try {
-      await saveRulesToFirestore(editRulesList);
+      localStorage.setItem('psychoAndriy_rules', JSON.stringify(editRulesList));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
+      setHasLocalEdits(true);
       setRules(editRulesList);
       setIsEditingRules(false);
-      showToast('Священний статут культу оновлено!', 'success');
+      showToast('Священний статут культу успішно збережено локально!', 'success');
+      try {
+        await saveRulesToFirestore(editRulesList);
+      } catch (err) {
+        console.warn('Firestore sync failed, local copy active:', err);
+      }
     } catch (err) {
       showToast('Помилка при збереженні правил', 'error');
     }
@@ -1009,10 +1231,12 @@ export default function App() {
   };
 
   const handleSaveAlphabet = async () => {
-    // Immediately persist to local state & localStorage to prevent any loss
     setAlphabet(editingAlphabetList);
     try {
       localStorage.setItem('psychoAndriy_alphabet', JSON.stringify(editingAlphabetList));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
+      setHasLocalEdits(true);
     } catch (e) {}
     setIsEditingAlphabet(false);
     showToast('Священну Абетку успішно оновлено та збережено!', 'success');
@@ -1072,10 +1296,12 @@ export default function App() {
   };
 
   const handleSaveGrammar = async () => {
-    // Immediately persist to local state & localStorage to prevent any loss
     setGrammar(editingGrammarList);
     try {
       localStorage.setItem('psychoAndriy_grammar', JSON.stringify(editingGrammarList));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      localStorage.setItem('andrelf_last_edit_time', String(Date.now()));
+      setHasLocalEdits(true);
     } catch (e) {}
     setIsEditingGrammar(false);
     showToast('Священну Граматику успішно оновлено та збережено!', 'success');
@@ -1105,17 +1331,36 @@ export default function App() {
     }
     setIsSavingWord(true);
     try {
-      await saveWordToDictionary({
+      const newWord: DictionaryItem = {
+        id: `word-${Date.now()}`,
         word: wordInput,
         runic: runicInput,
         meaning: meaningInput,
-        author: currentUser?.email?.split('@')[0] || 'Адепт'
-      });
+        createdAt: Date.now(),
+        author: currentUser?.email?.split('@')[0] || (isLocalAdmin ? 'Верховний Адмін' : 'Адепт')
+      };
+      let localDict: DictionaryItem[] = [];
+      try {
+        localDict = JSON.parse(localStorage.getItem('psychoAndriy_dictionary') || '[]');
+      } catch (e) {}
+      localDict.push(newWord);
+      localStorage.setItem('psychoAndriy_dictionary', JSON.stringify(localDict));
+      localStorage.setItem('andrelf_has_local_edits', 'true');
+      setHasLocalEdits(true);
+
+      setDictionary(prev => [...prev, newWord]);
       setWordInput('');
       setRunicInput('');
       setMeaningInput('');
-      await loadDictionary();
       showToast('Слово збережено в Дібрівський словник!', 'success');
+      try {
+        await saveWordToDictionary({
+          word: newWord.word,
+          runic: newWord.runic,
+          meaning: newWord.meaning,
+          author: newWord.author
+        });
+      } catch (e) {}
     } catch (err) {
       showToast('Помилка при збереженні слова', 'error');
     } finally {
@@ -1129,12 +1374,93 @@ export default function App() {
       message: 'Ви впевнені, що бажаєте вилучити це слово?',
       onConfirm: async () => {
         try {
-          await deleteWordFromDictionary(id);
-          await loadDictionary();
+          let localDict: DictionaryItem[] = [];
+          try {
+            localDict = JSON.parse(localStorage.getItem('psychoAndriy_dictionary') || '[]');
+          } catch (e) {}
+          localDict = localDict.filter(w => w.id !== id);
+          localStorage.setItem('psychoAndriy_dictionary', JSON.stringify(localDict));
+          setDictionary(prev => prev.filter(w => w.id !== id));
           showToast('Слово вилучено.', 'info');
+          try {
+            await deleteWordFromDictionary(id);
+          } catch (err) {}
         } catch (err) {}
       }
     });
+  };
+
+  // 5-Clicks Admin Trigger & GitHub Exporter Handlers
+  const handleAdmin5Clicks = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const now = Date.now();
+    if (now - lastAdminClickTime.current > 2500) {
+      adminClickCount.current = 1;
+    } else {
+      adminClickCount.current += 1;
+    }
+    lastAdminClickTime.current = now;
+
+    if (adminClickCount.current >= 5) {
+      adminClickCount.current = 0;
+      setIsLocalAdmin(true);
+      localStorage.setItem('andrelf_is_admin', 'true');
+      setShowAuthModal(false);
+      playSfx('tea');
+      showToast(
+        '🗝️ Верховний Адмін активовано (5 кліків)! Усі зміни доступні локально.',
+        'success',
+        'Автономний Адмін'
+      );
+      if (hasLocalEdits || isLocalAdmin) {
+        handleExportGitHubZip();
+      }
+    } else {
+      showToast(`Натисніть ще ${5 - adminClickCount.current} раз(и) для таємного входу/експорту Адміна`, 'info');
+    }
+  };
+
+  const handleExportGitHubZip = async () => {
+    setIsExporting(true);
+    showToast('Створюємо ZIP-архів з файлами для GitHub...', 'info');
+    try {
+      await downloadGitHubUpdateZip(rules, tracks, alphabet, grammar);
+      showToast('Архів завантажено! Перетягніть файли в репозиторій на GitHub.', 'success', '📦 Експорт готовий');
+    } catch (e: any) {
+      showToast('Помилка при створенні архіву: ' + e.message, 'error');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleExportDataTs = () => {
+    try {
+      downloadDataTsOnly(rules, tracks, alphabet, grammar);
+      showToast('Файл data.ts завантажено! Замініть ним src/data.ts на GitHub.', 'success');
+    } catch (e: any) {
+      showToast('Помилка експорту data.ts', 'error');
+    }
+  };
+
+  const handleAcceptNewSiteVersion = () => {
+    localStorage.removeItem('psychoAndriy_rules');
+    localStorage.removeItem('psychoAndriy_track_overrides');
+    localStorage.removeItem('psychoAndriy_custom_tracks');
+    localStorage.removeItem('psychoAndriy_alphabet');
+    localStorage.removeItem('psychoAndriy_grammar');
+    localStorage.removeItem('psychoAndriy_dictionary');
+    localStorage.removeItem('andrelf_has_local_edits');
+    localStorage.setItem('andrelf_acknowledged_version', String(SITE_BUILD_VERSION));
+    setShowSiteUpdatedModal(false);
+    setHasLocalEdits(false);
+    showToast('Сайт скинуто до останньої версії з GitHub!', 'success');
+    window.location.reload();
+  };
+
+  const handleKeepLocalChanges = () => {
+    localStorage.setItem('andrelf_acknowledged_version', String(SITE_BUILD_VERSION));
+    setShowSiteUpdatedModal(false);
+    showToast('Ваші локальні зміни залишено в силі.', 'info');
   };
 
   // Oracle
@@ -1373,21 +1699,51 @@ export default function App() {
                 <span className="sm:hidden">Поділитися</span>
               </button>
 
-              {currentUser ? (
-                <div className="flex items-center gap-2 text-xs bg-black/60 border border-neon-teal/30 px-3 py-1.5 rounded-xl text-neon-green font-mono">
-                  <span>{currentUser.email?.split('@')[0]}</span>
+              {isLocalAdmin || currentUser ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-1.5 text-xs bg-black/60 border border-neon-cyan/40 px-3 py-1.5 rounded-xl text-neon-cyan font-mono shadow-[0_0_10px_rgba(102,252,241,0.2)]">
+                    <Sparkles size={12} className="text-yellow-400" />
+                    <span>{currentUser ? currentUser.email?.split('@')[0] : 'Верховний Адмін'}</span>
+                    <button
+                      onClick={() => {
+                        if (currentUser) handleSignOut();
+                        setIsLocalAdmin(false);
+                        localStorage.removeItem('andrelf_is_admin');
+                        showToast('Вихід з режиму адміна виконано.', 'info');
+                      }}
+                      className="text-gray-400 hover:text-red-400 ml-1.5 transition-colors cursor-pointer"
+                      title="Вийти з режиму Адміна"
+                    >
+                      <LogOut size={13} />
+                    </button>
+                  </div>
                   <button
-                    onClick={handleSignOut}
-                    className="text-gray-400 hover:text-red-400 ml-1 transition-colors cursor-pointer"
-                    title="Вийти"
+                    onClick={handleExportGitHubZip}
+                    disabled={isExporting}
+                    className="text-xs bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-400/50 px-3 py-1.5 rounded-xl transition-all font-mono cursor-pointer flex items-center gap-1.5 shadow-[0_0_12px_rgba(16,185,129,0.3)]"
+                    title="Завантажити готовий ZIP-архів для GitHub"
                   >
-                    <LogOut size={13} />
+                    <FolderArchive size={13} />
+                    <span className="hidden sm:inline">{isExporting ? 'Створення ZIP...' : 'Експорт для GitHub (ZIP)'}</span>
+                    <span className="sm:hidden">{isExporting ? 'ZIP...' : 'ZIP'}</span>
+                  </button>
+                  <button
+                    onClick={handleExportDataTs}
+                    className="text-xs bg-black/60 hover:bg-black/90 text-gray-300 hover:text-white border border-neon-teal/40 px-2.5 py-1.5 rounded-xl transition-all font-mono cursor-pointer flex items-center gap-1"
+                    title="Завантажити лише файл src/data.ts"
+                  >
+                    <Download size={12} />
+                    <span>data.ts</span>
                   </button>
                 </div>
               ) : (
                 <button
-                  onClick={() => setShowAuthModal(true)}
+                  onClick={(e) => {
+                    handleAdmin5Clicks(e);
+                    setShowAuthModal(true);
+                  }}
                   className="text-xs bg-neon-cyan/10 hover:bg-neon-cyan/25 text-neon-cyan border border-neon-cyan/40 px-3 py-1.5 rounded-xl transition-all font-cinzel cursor-pointer flex items-center gap-1.5 shadow-[0_0_10px_rgba(102,252,241,0.2)]"
+                  title="Вхід для Адептів (5 швидких кліків активують Верховного Адміна)"
                 >
                   <Lock size={12} /> Вхід для Адептів
                 </button>
@@ -1522,7 +1878,7 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-                <div className="flex gap-3 pt-2">
+                <div className="flex flex-wrap gap-3 pt-2">
                   <button
                     onClick={addRule}
                     className="px-4 py-2 bg-black/70 border border-neon-teal hover:border-neon-cyan text-neon-cyan rounded-xl text-xs font-cinzel cursor-pointer flex items-center gap-1.5"
@@ -1534,6 +1890,12 @@ export default function App() {
                     className="px-5 py-2 bg-neon-cyan text-black font-cinzel font-bold rounded-xl text-xs hover:bg-white transition-all cursor-pointer flex items-center gap-1.5 shadow-[0_0_15px_#66fcf1]"
                   >
                     <Save size={14} /> Зберегти Статут
+                  </button>
+                  <button
+                    onClick={resetRulesToDefault}
+                    className="px-4 py-2 bg-black/70 border border-gray-600 hover:border-gray-400 text-gray-400 hover:text-white rounded-xl text-xs font-cinzel cursor-pointer flex items-center gap-1.5"
+                  >
+                    <RotateCcw size={14} /> Скинути канон
                   </button>
                 </div>
               </div>
@@ -2565,6 +2927,22 @@ export default function App() {
               />
             </div>
             <div>
+              <label className="block text-xs font-mono text-gray-400 mb-1 flex items-center justify-between">
+                <span>Назва аудіофайлу (в папці public/music)</span>
+                <span className="text-[10px] text-neon-teal font-mono">наприклад: andr.mp3</span>
+              </label>
+              <input
+                type="text"
+                placeholder="andr.mp3"
+                value={editTrackData.filename}
+                onChange={(e) => setEditTrackData(prev => ({ ...prev, filename: e.target.value }))}
+                className="w-full bg-black/60 border border-neon-teal/30 focus:border-neon-cyan rounded-lg p-2 text-sm text-gray-100 focus:outline-none font-mono"
+              />
+              <p className="text-[10px] text-gray-400 mt-1 font-mono">
+                Вкажіть точну назву .mp3 файлу (наприклад, <code className="text-neon-cyan">andr.mp3</code>), щоб трек зчитувався з папки <code className="text-neon-cyan">public/music/</code>.
+              </p>
+            </div>
+            <div>
               <label className="block text-xs font-mono text-gray-400 mb-1">Автор</label>
               <input
                 type="text"
@@ -2674,25 +3052,114 @@ export default function App() {
       {/* Auth Modal */}
       {showAuthModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-[fadeIn_0.2s_ease-out]">
-          <div className="glass-panel max-w-sm w-full rounded-2xl p-6 glow-box-cyan text-center space-y-4">
-            <Lock size={36} className="text-neon-cyan mx-auto animate-pulse" />
-            <h3 className="font-cinzel text-xl text-white font-bold">Вхід для Адептів</h3>
-            <p className="text-xs text-gray-300 font-serif leading-relaxed">
-              Авторизуйтесь через Google акаунт, аби ваші вподобання та створені сувої синхронізувалися з культом.
-            </p>
-            {authError && <p className="text-red-400 text-xs bg-red-950/40 p-2 rounded-lg border border-red-500/30">{authError}</p>}
-            <button
-              onClick={handleGoogleSignIn}
-              className="w-full py-2.5 bg-white text-black font-bold rounded-xl text-xs hover:bg-gray-100 transition-all cursor-pointer flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(255,255,255,0.4)]"
-            >
-              <span>Увійти через Google</span>
-            </button>
+          <div className="glass-panel max-w-md w-full rounded-2xl p-6 glow-box-cyan text-center space-y-4 relative">
             <button
               onClick={() => setShowAuthModal(false)}
-              className="text-xs text-gray-500 hover:text-gray-300 cursor-pointer pt-2"
+              className="absolute top-4 right-4 text-gray-400 hover:text-white cursor-pointer"
             >
-              Продовжити як Гість
+              <X size={18} />
             </button>
+            <div
+              onClick={handleAdmin5Clicks}
+              className="cursor-pointer inline-block"
+              title="Натисніть 5 разів для входу або завантаження файлів для GitHub!"
+            >
+              <Lock size={36} className="text-neon-cyan mx-auto animate-pulse hover:scale-110 transition-transform" />
+            </div>
+            <h3
+              onClick={handleAdmin5Clicks}
+              className="font-cinzel text-xl text-white font-bold cursor-pointer select-none"
+            >
+              Вхід для Адептів та Адміна
+            </h3>
+            <p className="text-xs text-gray-300 font-serif leading-relaxed">
+              На статичному сайті (GitHub Pages) Google-авторизація вимагає додавання домену у Firebase.
+              Ви можете скористатися <strong>Автономним Режимом Верховного Адміна</strong> — без реєстрації та паролів!
+            </p>
+
+            {authError && <p className="text-red-400 text-xs bg-red-950/40 p-2 rounded-lg border border-red-500/30">{authError}</p>}
+
+            <div className="space-y-2.5 pt-1">
+              <button
+                onClick={(e) => {
+                  handleAdmin5Clicks(e);
+                  setIsLocalAdmin(true);
+                  localStorage.setItem('andrelf_is_admin', 'true');
+                  setShowAuthModal(false);
+                  showToast('🗝️ Верховний Адмін активовано! Тепер ви можете редагувати все на сайті.', 'success');
+                }}
+                className="w-full py-2.5 bg-gradient-to-r from-neon-cyan to-neon-teal text-black font-cinzel font-bold rounded-xl text-xs hover:brightness-110 transition-all cursor-pointer flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(102,252,241,0.5)]"
+              >
+                <Sparkles size={14} />
+                <span>Увійти як Верховний Адмін (Автономно)</span>
+              </button>
+
+              <button
+                onClick={handleGoogleSignIn}
+                className="w-full py-2 bg-white/90 text-black font-medium rounded-xl text-xs hover:bg-white transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <span>Спробувати вхід через Google</span>
+              </button>
+
+              {hasLocalEdits && (
+                <button
+                  onClick={handleExportGitHubZip}
+                  className="w-full py-2 bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 hover:bg-emerald-500/30 font-mono rounded-xl text-xs transition-all cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <FolderArchive size={14} />
+                  <span>Завантажити всі локальні зміни для GitHub (ZIP)</span>
+                </button>
+              )}
+            </div>
+
+            <p className="text-[11px] text-gray-400 font-mono">
+              💡 Підказка: 5 швидких кліків по замку або кнопці також активують адмін-режим та завантажують файли для GitHub!
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Site Updated On GitHub Modal */}
+      {showSiteUpdatedModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-[fadeIn_0.2s_ease-out]">
+          <div className="glass-panel max-w-lg w-full rounded-2xl p-6 glow-box-cyan text-center space-y-4 border border-neon-cyan/50 shadow-[0_0_25px_rgba(102,252,241,0.3)]">
+            <div className="w-12 h-12 rounded-full bg-neon-cyan/20 border border-neon-cyan flex items-center justify-center mx-auto text-neon-cyan animate-pulse">
+              <RefreshCw size={24} />
+            </div>
+            <h3 className="font-cinzel text-xl text-neon-cyan font-bold">
+              Сайт було оновлено на GitHub!
+            </h3>
+            <p className="text-xs sm:text-sm text-gray-200 leading-relaxed font-serif">
+              Виявлено свіжу версію сайту в репозиторії. При цьому у вашому браузері збережені попередні локальні зміни.
+            </p>
+            <p className="text-xs text-gray-400 font-sans">
+              Бажаєте перейти на новий сайт з GitHub (скинувши ваші локальні чернетки), чи залишити ваші локальні редагування?
+            </p>
+
+            <div className="flex flex-col gap-2 pt-2">
+              <button
+                onClick={handleAcceptNewSiteVersion}
+                className="w-full py-2.5 bg-gradient-to-r from-neon-cyan to-neon-teal text-black font-cinzel font-bold rounded-xl text-xs hover:brightness-110 transition-all cursor-pointer flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(102,252,241,0.4)]"
+              >
+                <RefreshCw size={14} />
+                <span>Оновити сайт (завантажити новий сайт з GitHub)</span>
+              </button>
+
+              <button
+                onClick={handleExportGitHubZip}
+                className="w-full py-2 bg-emerald-500/20 text-emerald-300 border border-emerald-400/40 hover:bg-emerald-500/30 rounded-xl text-xs font-mono transition-all cursor-pointer flex items-center justify-center gap-2"
+              >
+                <FolderArchive size={14} />
+                <span>Зберегти мої зміни в ZIP перед оновленням</span>
+              </button>
+
+              <button
+                onClick={handleKeepLocalChanges}
+                className="w-full py-2 bg-transparent text-gray-400 hover:text-white border border-gray-700 hover:border-gray-500 rounded-xl text-xs cursor-pointer transition-colors"
+              >
+                Залишити мої локальні зміни (не оновлювати зараз)
+              </button>
+            </div>
           </div>
         </div>
       )}
